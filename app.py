@@ -1,17 +1,26 @@
+# app.py — Notes Compiler (OpenAI API) + Scanned PDF OCR (via OpenAI Vision)
+#
+# Install:
+#   pip install streamlit openai pypdf python-docx python-pptx pillow scikit-learn pymupdf
+#
+# Run (PowerShell):
+#   $env:OPENAI_API_KEY="sk-..."
+#   $env:STREAMLIT_SERVER_MAX_UPLOAD_SIZE="2000"   # optional (MB)
+#   streamlit run app.py
+#
+# If you don't want OCR, toggle it off in the sidebar.
+
 import os
 import io
 import re
-import json
-import math
-import time
 import base64
 import hashlib
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import List, Optional, Tuple
 
 import streamlit as st
 
-# Optional deps (handled gracefully if missing)
+# Optional deps
 try:
     from pypdf import PdfReader
 except Exception:
@@ -33,13 +42,17 @@ except Exception:
     Image = None
 
 try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+
+try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 except Exception:
     TfidfVectorizer = None
     cosine_similarity = None
 
-# OpenAI SDK (Responses API)
 try:
     from openai import OpenAI
 except Exception:
@@ -47,81 +60,78 @@ except Exception:
 
 
 # -----------------------------
-# UI + APP CONFIG
+# UI CONFIG
 # -----------------------------
-st.set_page_config(
-    page_title="Notes Compiler",
-    page_icon="🧠",
-    layout="wide",
-)
+st.set_page_config(page_title="Notes Compiler", page_icon="🧠", layout="wide")
 
 CSS = """
 <style>
-/* Subtle modern look */
 .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
 h1, h2, h3 { letter-spacing: -0.02em; }
 hr { margin: 1.2rem 0; }
 small { opacity: 0.75; }
-.stButton>button { border-radius: 14px; padding: 0.6rem 1rem; }
-.stDownloadButton>button { border-radius: 14px; padding: 0.6rem 1rem; }
+.stButton>button, .stDownloadButton>button { border-radius: 14px; padding: 0.6rem 1rem; }
 code { border-radius: 10px; padding: 0.15rem 0.35rem; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-st.title("🧠 Notes Compiler (OpenAI API)")
+st.title("🧠 Notes Compiler (OpenAI API) + Scanned PDF OCR")
 st.caption(
-    "Upload your notes → compile into clean, structured study notes (handles big files via chunking). "
-    "Key is read from terminal env var `OPENAI_API_KEY`."
+    "Upload your notes → compile into clean study notes. "
+    "Scanned PDFs are OCR’d by rendering pages to images and using OpenAI vision."
 )
 
 # -----------------------------
-# UTIL
+# DATA MODEL
 # -----------------------------
 @dataclass
 class DocItem:
     name: str
-    kind: str  # 'text' | 'pdf' | 'docx' | 'pptx' | 'image' | 'unknown'
+    kind: str         # 'text' | 'pdf' | 'docx' | 'pptx' | 'image' | 'unknown'
     mime: str
     sha256: str
     text: Optional[str] = None
     image_bytes: Optional[bytes] = None
+    raw_bytes: Optional[bytes] = None  # keep PDF bytes for OCR
 
 
+# -----------------------------
+# HELPERS
+# -----------------------------
 def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def approx_tokens(text: str) -> int:
-    # Roughly 4 chars/token average in English; works well enough for chunk sizing.
-    if not text:
-        return 0
-    return max(1, int(len(text) / 4))
-
-
 def clean_text(s: str) -> str:
+    if not s:
+        return ""
     s = s.replace("\x00", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 
+def approx_tokens(text: str) -> int:
+    # rough: ~4 chars/token
+    if not text:
+        return 0
+    return max(1, int(len(text) / 4))
+
+
 def split_paragraphs(text: str) -> List[str]:
-    parts = re.split(r"\n\s*\n", text.strip())
+    parts = re.split(r"\n\s*\n", (text or "").strip())
     return [p.strip() for p in parts if p.strip()]
 
 
 def chunk_text(text: str, target_tokens: int = 1800, overlap_tokens: int = 200) -> List[str]:
-    """
-    Paragraph-aware chunking with overlap.
-    """
     text = clean_text(text)
     paras = split_paragraphs(text)
     if not paras:
         return []
 
-    chunks = []
-    cur = []
+    chunks: List[str] = []
+    cur: List[str] = []
     cur_tokens = 0
 
     def flush():
@@ -135,20 +145,21 @@ def chunk_text(text: str, target_tokens: int = 1800, overlap_tokens: int = 200) 
 
     for p in paras:
         pt = approx_tokens(p)
-        # If a single paragraph is huge, split by sentences
+
+        # Very large paragraph → split by sentences
         if pt > target_tokens:
             flush()
             sentences = re.split(r"(?<=[.!?])\s+", p.strip())
-            buf = []
+            buf: List[str] = []
             bt = 0
             for sent in sentences:
                 stoks = approx_tokens(sent)
                 if bt + stoks > target_tokens and buf:
                     chunks.append(" ".join(buf).strip())
-                    # overlap (best-effort)
                     if overlap_tokens > 0:
                         tail = " ".join(buf)[-overlap_tokens * 4 :]
-                        buf = [tail] if tail.strip() else []
+                        tail = tail.strip()
+                        buf = [tail] if tail else []
                         bt = approx_tokens(" ".join(buf))
                     else:
                         buf = []
@@ -159,14 +170,11 @@ def chunk_text(text: str, target_tokens: int = 1800, overlap_tokens: int = 200) 
                 chunks.append(" ".join(buf).strip())
             continue
 
+        # Normal case
         if cur_tokens + pt > target_tokens and cur:
             flush()
-            # overlap from previous chunk tail
             if overlap_tokens > 0 and chunks:
-                tail = chunks[-1]
-                # take last ~overlap_tokens tokens ≈ overlap_tokens*4 chars
-                tail = tail[-overlap_tokens * 4 :]
-                tail = tail.strip()
+                tail = chunks[-1][-overlap_tokens * 4 :].strip()
                 if tail:
                     cur = [tail]
                     cur_tokens = approx_tokens(tail)
@@ -183,37 +191,25 @@ def get_openai_client() -> "OpenAI":
         raise RuntimeError("OpenAI SDK not installed. Run: pip install openai")
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY env var.")
+        raise RuntimeError("Missing OPENAI_API_KEY env var (set it in your terminal).")
     return OpenAI(api_key=api_key)
 
 
-def _get(obj, key, default=None):
-    if obj is None:
-        return default
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
 def response_to_text(resp) -> str:
-    """
-    Extract text robustly from Responses API object.
-    """
-    # SDK often provides output_text convenience
-    t = _get(resp, "output_text", None)
+    # Try SDK convenience first
+    t = getattr(resp, "output_text", None)
     if isinstance(t, str) and t.strip():
         return t.strip()
 
     out = []
-    items = _get(resp, "output", []) or []
+    items = getattr(resp, "output", []) or []
     for item in items:
-        itype = _get(item, "type", None)
-        if itype == "message":
-            content = _get(item, "content", []) or []
+        if getattr(item, "type", None) == "message":
+            content = getattr(item, "content", []) or []
             for c in content:
-                ctype = _get(c, "type", None)
+                ctype = getattr(c, "type", None)
                 if ctype in ("output_text", "text"):
-                    txt = _get(c, "text", None)
+                    txt = getattr(c, "text", None)
                     if isinstance(txt, str) and txt.strip():
                         out.append(txt.strip())
     return "\n\n".join(out).strip()
@@ -240,22 +236,21 @@ def oai_text(
     return response_to_text(resp)
 
 
-def oai_vision_transcribe(
+def oai_vision(
     prompt: str,
     image_bytes: bytes,
     mime: str,
     *,
     model: str,
     instructions: str,
-    temperature: float = 0.2,
-    max_output_tokens: int = 1600,
+    temperature: float = 0.0,
+    max_output_tokens: int = 1800,
     store: bool = False,
 ) -> str:
     client = get_openai_client()
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:{mime};base64,{b64}"
 
-    # Responses API supports image inputs (input_image).
     input_items = [
         {
             "role": "user",
@@ -278,12 +273,12 @@ def oai_vision_transcribe(
 
 
 # -----------------------------
-# FILE INGEST
+# FILE TEXT EXTRACTION
 # -----------------------------
 def extract_text_from_upload(name: str, mime: str, data: bytes) -> Tuple[str, str]:
     ext = (name.split(".")[-1] or "").lower()
+
     if ext in ("txt", "md", "markdown", "csv", "log"):
-        # Try utf-8 first, then fallback.
         try:
             return clean_text(data.decode("utf-8")), "text"
         except Exception:
@@ -313,7 +308,7 @@ def extract_text_from_upload(name: str, mime: str, data: bytes) -> Tuple[str, st
         except Exception:
             return "", "docx"
 
-    if ext in ("pptx",):
+    if ext == "pptx":
         if Presentation is None:
             return "", "pptx"
         try:
@@ -329,7 +324,6 @@ def extract_text_from_upload(name: str, mime: str, data: bytes) -> Tuple[str, st
         except Exception:
             return "", "pptx"
 
-    # images
     if ext in ("png", "jpg", "jpeg", "webp", "bmp"):
         return "", "image"
 
@@ -337,11 +331,56 @@ def extract_text_from_upload(name: str, mime: str, data: bytes) -> Tuple[str, st
 
 
 # -----------------------------
+# SCANNED PDF OCR (PyMuPDF → PNG → OpenAI Vision)
+# -----------------------------
+def is_text_sparse(text: Optional[str], threshold_chars: int) -> bool:
+    if not text:
+        return True
+    return len(text.strip()) < threshold_chars
+
+
+def maybe_downscale_png(png_bytes: bytes, max_dim: int = 2200) -> bytes:
+    """Downscale very large rendered pages (cheaper/faster vision)."""
+    if Image is None:
+        return png_bytes
+    try:
+        img = Image.open(io.BytesIO(png_bytes))
+        w, h = img.size
+        if max(w, h) <= max_dim:
+            return png_bytes
+        scale = max_dim / float(max(w, h))
+        new_size = (max(1, int(w * scale)), max(1, int(h * scale)))
+        img = img.resize(new_size)
+        out = io.BytesIO()
+        img.save(out, format="PNG", optimize=True)
+        return out.getvalue()
+    except Exception:
+        return png_bytes
+
+
+def pdf_pages_to_pngs(pdf_bytes: bytes, zoom: float = 2.0, max_pages: int = 0):
+    if fitz is None:
+        raise RuntimeError("PyMuPDF not installed. Run: pip install pymupdf")
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n = doc.page_count
+    if max_pages and max_pages > 0:
+        n = min(n, max_pages)
+
+    mat = fitz.Matrix(zoom, zoom)
+    for i in range(n):
+        page = doc.load_page(i)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        png = pix.tobytes("png")
+        yield (i + 1), png
+
+
+# -----------------------------
 # PROMPTS
 # -----------------------------
 BASE_INSTRUCTIONS = """You are a strict, helpful NOTES COMPILER.
 Rules:
-- Be accurate. If something is unclear, label it as [CHECK] instead of guessing.
+- Be accurate. If unclear, label it as [CHECK] instead of guessing.
 - Prefer structured bullet points and short paragraphs.
 - Keep formulas, definitions, and step-by-step processes.
 - Remove fluff, keep exam-relevant detail.
@@ -404,7 +443,7 @@ Requirements:
 - Start with: Title, then a Table of Contents
 - Then sections grouped by topic (merge overlaps even if different files)
 - Keep it exam-ready: definitions, steps, formulas, examples, pitfalls
-- Add a final "1-page Cheat Sheet" section (very dense bullets)
+- Add a final "1-page Cheat Sheet" section (dense bullets)
 - Add a final "Flash Q&A" section with 20 short Qs and answers
 
 Here are the source notes:
@@ -413,18 +452,18 @@ Here are the source notes:
 
 
 # -----------------------------
-# SIDEBAR CONTROLS
+# SIDEBAR SETTINGS
 # -----------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
 
     if os.getenv("OPENAI_API_KEY", "").strip():
-        st.success("OPENAI_API_KEY detected in environment ✅")
+        st.success("OPENAI_API_KEY detected ✅")
     else:
-        st.warning("No OPENAI_API_KEY found. Set it in your terminal before running.")
+        st.warning("No OPENAI_API_KEY found. Set it in your terminal.")
 
-    model = st.text_input("Model", value="gpt-4o-mini", help="You can change this to any model you have access to.")
-    store = st.toggle("Store responses on OpenAI (privacy)", value=False, help="If off, requests set store=false when supported.")
+    model = st.text_input("Model", value="gpt-4o-mini")
+    store = st.toggle("Store responses on OpenAI (privacy)", value=False)
     temperature = st.slider("Creativity (temperature)", 0.0, 1.2, 0.2, 0.05)
 
     st.divider()
@@ -436,53 +475,67 @@ with st.sidebar:
     overlap_tokens = st.slider("Chunk overlap (approx tokens)", 0, 600, 200, 25)
 
     st.divider()
+    st.subheader("🧾 Scanned PDF OCR")
+    enable_pdf_ocr = st.toggle("OCR scanned PDFs", value=True)
+    pdf_ocr_chars_threshold = st.number_input("Treat PDF as scanned if extracted text < (chars)", 0, 10000, 300, 50)
+    pdf_ocr_max_pages = st.number_input("Max PDF pages to OCR (0 = all)", 0, 10000, 0, 10)
+    pdf_render_zoom = st.slider("PDF render quality (zoom)", 1.0, 3.0, 2.0, 0.25)
+    ocr_downscale_max_dim = st.number_input("Downscale OCR images max dimension (px)", 800, 5000, 2200, 100)
+
+    if enable_pdf_ocr and fitz is None:
+        st.warning("OCR needs PyMuPDF: pip install pymupdf")
+
     st.caption("Upload limit: Streamlit defaults to 200MB/file. Increase with "
                "`STREAMLIT_SERVER_MAX_UPLOAD_SIZE` or `--server.maxUploadSize`.")
 
 
 # -----------------------------
-# MAIN: UPLOAD
+# SESSION STATE
+# -----------------------------
+for key, default in [
+    ("docs", {}),
+    ("chunk_summaries", {}),
+    ("doc_notes", {}),
+    ("compiled_notes", None),
+    ("doc_notes_list", []),
+    ("retriever", None),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+# -----------------------------
+# MAIN UPLOADER
 # -----------------------------
 uploaded = st.file_uploader(
-    "Upload notes (PDF/DOCX/PPTX/TXT/MD + images). You can upload multiple files.",
+    "Upload notes (PDF/DOCX/PPTX/TXT/MD + images). Multiple files supported.",
     type=["pdf", "docx", "pptx", "txt", "md", "markdown", "png", "jpg", "jpeg", "webp", "bmp"],
     accept_multiple_files=True,
 )
 
-colA, colB = st.columns([1, 1], vertical_alignment="top")
-with colA:
+c1, c2 = st.columns([1, 1], vertical_alignment="top")
+with c1:
     compile_btn = st.button("🚀 Compile Notes", type="primary", use_container_width=True)
-with colB:
+with c2:
     clear_btn = st.button("🧹 Clear session", use_container_width=True)
 
 if clear_btn:
-    for k in ["docs", "chunk_summaries", "doc_notes", "compiled_notes", "retriever"]:
+    for k in ["docs", "chunk_summaries", "doc_notes", "compiled_notes", "doc_notes_list", "retriever"]:
         st.session_state.pop(k, None)
     st.toast("Cleared.", icon="✅")
-
-# Session caches
-if "docs" not in st.session_state:
-    st.session_state["docs"] = {}
-if "chunk_summaries" not in st.session_state:
-    st.session_state["chunk_summaries"] = {}
-if "doc_notes" not in st.session_state:
-    st.session_state["doc_notes"] = {}
-if "compiled_notes" not in st.session_state:
-    st.session_state["compiled_notes"] = None
+    st.stop()
 
 
 def ingest_files(files) -> List[DocItem]:
-    items = []
+    items: List[DocItem] = []
     for f in files or []:
         data = f.getvalue()
         sha = sha256_bytes(data)
         name = f.name
         mime = getattr(f, "type", "") or "application/octet-stream"
 
-        # cached?
-        cache_key = sha
-        if cache_key in st.session_state["docs"]:
-            items.append(st.session_state["docs"][cache_key])
+        if sha in st.session_state["docs"]:
+            items.append(st.session_state["docs"][sha])
             continue
 
         text, kind = extract_text_from_upload(name, mime, data)
@@ -493,8 +546,9 @@ def ingest_files(files) -> List[DocItem]:
             sha256=sha,
             text=text if text else None,
             image_bytes=data if kind == "image" else None,
+            raw_bytes=data if kind == "pdf" else None,
         )
-        st.session_state["docs"][cache_key] = doc_item
+        st.session_state["docs"][sha] = doc_item
         items.append(doc_item)
     return items
 
@@ -503,13 +557,13 @@ docs = ingest_files(uploaded)
 
 if docs:
     total_chars = sum(len(d.text or "") for d in docs)
-    st.info(f"Loaded {len(docs)} file(s). Text chars extracted so far: {total_chars:,}")
+    st.info(f"Loaded {len(docs)} file(s). Extracted text chars so far: {total_chars:,}")
 
-    missing_extract = [d for d in docs if d.kind in ("pdf", "docx", "pptx") and not (d.text and d.text.strip())]
-    if missing_extract:
+    low_text_pdfs = [d for d in docs if d.kind == "pdf" and is_text_sparse(d.text, int(pdf_ocr_chars_threshold))]
+    if low_text_pdfs:
         st.warning(
-            "Some files extracted little/no text (common for scanned PDFs). "
-            "Tip: upload images (screenshots/pages) or ensure PDFs are text-based."
+            "Some PDFs look scanned / low-text. "
+            "OCR will run (if enabled) and then they’ll compile normally."
         )
 
 
@@ -520,56 +574,113 @@ def compile_pipeline(docs: List[DocItem]) -> str:
     if not docs:
         raise RuntimeError("No files uploaded.")
 
-    # 1) Turn images into text (vision)
+    # 1) Transcribe standalone images (notes photos, screenshots)
     vision_docs = [d for d in docs if d.kind == "image"]
-    text_docs = [d for d in docs if d.kind != "image"]
-
     if vision_docs:
-        st.subheader("🖼️ Transcribing images")
+        st.subheader("🖼️ Transcribing uploaded images")
         for i, d in enumerate(vision_docs, 1):
             st.write(f"Image {i}/{len(vision_docs)}: `{d.name}`")
             cache_key = f"vision:{d.sha256}:{model}:{level}:{mode}"
             if cache_key in st.session_state["doc_notes"]:
-                st.caption("Using cached transcription ✅")
                 d.text = st.session_state["doc_notes"][cache_key]
+                st.caption("Using cached transcription ✅")
                 continue
 
             prompt = (
                 "Extract ALL readable text from this image of notes. "
-                "Then rewrite into clean, structured study notes in Markdown."
+                "Then rewrite it into clean, structured study notes in Markdown."
             )
-            txt = oai_vision_transcribe(
+            txt = oai_vision(
                 prompt,
                 d.image_bytes or b"",
                 d.mime or "image/png",
                 model=model,
                 instructions=BASE_INSTRUCTIONS,
-                temperature=temperature,
+                temperature=max(0.0, min(0.2, temperature)),
                 max_output_tokens=1800,
                 store=store,
             )
             d.text = clean_text(txt)
             st.session_state["doc_notes"][cache_key] = d.text
 
-    # 2) Chunk + summarize each doc
+    # 2) OCR scanned PDFs (render pages -> vision -> text)
+    if enable_pdf_ocr:
+        scanned = [d for d in docs if d.kind == "pdf" and is_text_sparse(d.text, int(pdf_ocr_chars_threshold))]
+        if scanned:
+            st.subheader("🧾 OCR for scanned / low-text PDFs")
+            if fitz is None:
+                raise RuntimeError("OCR enabled but PyMuPDF is missing. Run: pip install pymupdf")
+
+            for d in scanned:
+                if not d.raw_bytes:
+                    continue
+
+                st.write(f"OCR: `{d.name}`")
+                page_texts: List[str] = []
+
+                for page_no, png_bytes in pdf_pages_to_pngs(
+                    d.raw_bytes,
+                    zoom=float(pdf_render_zoom),
+                    max_pages=int(pdf_ocr_max_pages),
+                ):
+                    # downscale huge renders to keep calls lighter
+                    png_bytes = maybe_downscale_png(png_bytes, max_dim=int(ocr_downscale_max_dim))
+
+                    cache_key = f"pdfocr:{d.sha256}:p{page_no}:z{pdf_render_zoom}:md{ocr_downscale_max_dim}:{model}"
+                    if cache_key in st.session_state["chunk_summaries"]:
+                        page_texts.append(st.session_state["chunk_summaries"][cache_key])
+                        continue
+
+                    prompt = (
+                        "Extract ALL readable text from this scanned PDF page. "
+                        "Do NOT summarize. Preserve headings, bullets, numbering, and equations as written."
+                    )
+
+                    page_txt = oai_vision(
+                        prompt,
+                        png_bytes,
+                        "image/png",
+                        model=model,
+                        instructions="You are an OCR engine. Output text only. No extra commentary.",
+                        temperature=0.0,
+                        max_output_tokens=2000,
+                        store=store,
+                    )
+                    page_txt = clean_text(page_txt)
+                    st.session_state["chunk_summaries"][cache_key] = page_txt
+                    page_texts.append(page_txt)
+
+                d.text = clean_text("\n\n".join(page_texts))
+                if not (d.text or "").strip():
+                    st.warning(f"OCR returned no text for `{d.name}`. Try increasing zoom or max pages.")
+
+    # 3) Chunk + summarize each doc
     st.subheader("🧩 Chunking & summarizing")
-    progress = st.progress(0)
+    progress = st.progress(0.0)
     status = st.empty()
 
-    doc_notes: List[Tuple[str, str]] = []
-    total_steps = max(1, sum(max(1, len(chunk_text(d.text or "", chunk_tokens, overlap_tokens))) for d in docs))
+    usable_docs = [d for d in docs if (d.text or "").strip()]
+    if not usable_docs:
+        raise RuntimeError("No usable text extracted. (If scanned PDFs: enable OCR and install pymupdf.)")
+
+    # estimate steps for progress
+    total_steps = 0
+    doc_chunks_map = {}
+    for d in usable_docs:
+        chs = chunk_text(d.text or "", target_tokens=int(chunk_tokens), overlap_tokens=int(overlap_tokens))
+        doc_chunks_map[d.sha256] = chs
+        total_steps += max(1, len(chs))
+    total_steps = max(1, total_steps)
+
     done = 0
+    doc_notes_list: List[Tuple[str, str]] = []
 
-    for d in docs:
-        raw = d.text or ""
-        if not raw.strip():
-            continue
-
-        chunks = chunk_text(raw, chunk_tokens, overlap_tokens)
+    for d in usable_docs:
+        chunks = doc_chunks_map.get(d.sha256, [])
         if not chunks:
             continue
 
-        chunk_summaries = []
+        chunk_summaries: List[str] = []
         for idx, ch in enumerate(chunks, 1):
             done += 1
             status.write(f"Summarizing `{d.name}` chunk {idx}/{len(chunks)} …")
@@ -593,7 +704,7 @@ def compile_pipeline(docs: List[DocItem]) -> str:
             st.session_state["chunk_summaries"][cache_key] = summ
             chunk_summaries.append(summ)
 
-        # merge doc
+        # merge chunks per doc
         status.write(f"Merging chunks for `{d.name}` …")
         merge_key = f"docmerge:{d.sha256}:{model}:{level}:{mode}"
         if merge_key in st.session_state["doc_notes"]:
@@ -604,25 +715,27 @@ def compile_pipeline(docs: List[DocItem]) -> str:
                 prompt,
                 model=model,
                 instructions=BASE_INSTRUCTIONS,
-                temperature=max(0.0, min(0.4, temperature)),
+                temperature=max(0.0, min(0.35, temperature)),
                 max_output_tokens=2200,
                 store=store,
             )
             merged = clean_text(merged)
             st.session_state["doc_notes"][merge_key] = merged
 
-        doc_notes.append((d.name, merged))
+        doc_notes_list.append((d.name, merged))
 
-    if not doc_notes:
-        raise RuntimeError("No usable text extracted from uploads.")
+    if not doc_notes_list:
+        raise RuntimeError("Nothing to compile after processing.")
 
-    # 3) Global compile
+    st.session_state["doc_notes_list"] = doc_notes_list
+
+    # 4) Global compile
     st.subheader("🧱 Building master compiled notes")
-    global_key = f"global:{sha256_bytes(('|'.join([x[0] for x in doc_notes])).encode())}:{model}:{level}:{mode}"
-    if st.session_state.get("compiled_notes"):
+    global_key = f"global:{sha256_bytes('|'.join([n for n, _ in doc_notes_list]).encode())}:{model}:{level}:{mode}"
+    if st.session_state.get("compiled_notes") and st.session_state.get("_compiled_key") == global_key:
         return st.session_state["compiled_notes"]
 
-    prompt = make_global_merge_prompt(doc_notes, mode, level)
+    prompt = make_global_merge_prompt(doc_notes_list, mode, level)
     compiled = oai_text(
         prompt,
         model=model,
@@ -633,23 +746,26 @@ def compile_pipeline(docs: List[DocItem]) -> str:
     )
     compiled = clean_text(compiled)
 
+    st.session_state["_compiled_key"] = global_key
     st.session_state["compiled_notes"] = compiled
-    st.session_state["doc_notes_list"] = doc_notes
+    # reset retriever whenever compiled changes
+    st.session_state["retriever"] = None
     return compiled
 
 
 # -----------------------------
-# RUN
+# RUN COMPILE
 # -----------------------------
 if compile_btn:
-    if OpenAI is None:
-        st.error("Missing OpenAI SDK. Run: pip install openai")
-    else:
-        try:
+    try:
+        if OpenAI is None:
+            st.error("Missing OpenAI SDK. Install: pip install openai")
+        else:
             compiled = compile_pipeline(docs)
             st.success("Done ✅")
-        except Exception as e:
-            st.error(f"Compile failed: {e}")
+    except Exception as e:
+        st.error(f"Compile failed: {e}")
+
 
 # -----------------------------
 # SHOW OUTPUT + DOWNLOADS
@@ -660,20 +776,20 @@ if compiled:
     st.markdown(compiled)
 
     md_bytes = compiled.encode("utf-8")
-    c1, c2, c3 = st.columns([1, 1, 2], vertical_alignment="center")
-    with c1:
+    a, b, c = st.columns([1, 1, 2], vertical_alignment="center")
+    with a:
         st.download_button("⬇️ Download Markdown", data=md_bytes, file_name="compiled_notes.md", mime="text/markdown")
-    with c2:
+    with b:
         st.download_button("⬇️ Download TXT", data=md_bytes, file_name="compiled_notes.txt", mime="text/plain")
-    with c3:
-        st.caption("Tip: if you want cleaner output, lower temperature and set Depth to Standard/Advanced.")
+    with c:
+        st.caption("Tip: Lower temperature for cleaner, more consistent notes.")
 
-    # Show doc-level notes in an expander
-    with st.expander("🔎 See per-file merged notes (sources)", expanded=False):
+    with st.expander("🔎 Per-file merged notes (sources)", expanded=False):
         for name, note in st.session_state.get("doc_notes_list", []):
             st.markdown(f"### {name}")
             st.markdown(note)
             st.divider()
+
 
 # -----------------------------
 # Q&A OVER YOUR COMPILED NOTES (local retrieval + OpenAI)
@@ -687,14 +803,13 @@ else:
     if TfidfVectorizer is None:
         st.warning("Install scikit-learn to enable fast local retrieval: pip install scikit-learn")
     else:
-        # Build retriever once
-        if "retriever" not in st.session_state:
+        if st.session_state["retriever"] is None:
             note_chunks = chunk_text(compiled, target_tokens=900, overlap_tokens=120)
             vect = TfidfVectorizer(stop_words="english", max_features=50000)
             X = vect.fit_transform(note_chunks)
             st.session_state["retriever"] = {"chunks": note_chunks, "vect": vect, "X": X}
 
-        q = st.chat_input("Ask anything (e.g., 'Explain topic X with an example' / 'Make me 10 flashcards')")
+        q = st.chat_input("Ask anything (e.g., 'Explain topic X with an example' / 'Make 15 flashcards')")
 
         if q:
             retr = st.session_state["retriever"]
@@ -706,14 +821,14 @@ else:
 
             answer_prompt = f"""
 You are answering using ONLY the notes context below.
-If the answer is not in the notes, say: "Not found in the notes."
+If the answer is not in the notes, say exactly: "Not found in the notes."
 
 Question: {q}
 
 Notes context:
 \"\"\"\n{context}\n\"\"\"
 
-Answer clearly, step-by-step where useful. If relevant, add one short example.
+Answer clearly. Use steps where useful. If relevant, add one short example.
 """
             with st.chat_message("user"):
                 st.write(q)
