@@ -1,4 +1,4 @@
-# app.py — Notes Compiler (OpenAI API) + Scanned PDF OCR
+# app.py — Notes Compiler (OpenAI API) + ALWAYS-ON Scanned PDF OCR
 # ✅ Compile → Download (NO Q&A / chat)
 #
 # Install:
@@ -69,7 +69,7 @@ small { opacity: 0.75; }
 st.markdown(CSS, unsafe_allow_html=True)
 
 st.title("🧠 Notes Compiler (Compile → Download)")
-st.caption("Upload notes (PDF/DOCX/PPTX/TXT/MD + images). Scanned PDFs are OCR’d via OpenAI vision.")
+st.caption("Upload notes (PDF/DOCX/PPTX/TXT/MD + images). Scanned PDFs are OCR’d automatically via OpenAI vision.")
 
 
 # -----------------------------
@@ -347,7 +347,7 @@ def maybe_downscale_png(png_bytes: bytes, max_dim: int) -> bytes:
 
 def pdf_pages_to_pngs(pdf_bytes: bytes, zoom: float, max_pages: int):
     if fitz is None:
-        raise RuntimeError("PyMuPDF not installed. Run: pip install pymupdf")
+        raise RuntimeError("PyMuPDF missing. Install: pip install pymupdf")
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     n = doc.page_count
     if max_pages and max_pages > 0:
@@ -436,7 +436,7 @@ Here are the source notes:
 
 
 # -----------------------------
-# SIDEBAR SETTINGS
+# SIDEBAR SETTINGS (OCR always on)
 # -----------------------------
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -459,15 +459,14 @@ with st.sidebar:
     overlap_tokens = st.slider("Chunk overlap (approx tokens)", 0, 600, 200, 25)
 
     st.divider()
-    st.subheader("🧾 Scanned PDF OCR")
-    enable_pdf_ocr = st.toggle("OCR scanned PDFs", value=True)
+    st.subheader("🧾 Scanned PDF OCR (Always On)")
     pdf_ocr_chars_threshold = st.number_input("Treat PDF as scanned if extracted text < (chars)", 0, 10000, 300, 50)
     pdf_ocr_max_pages = st.number_input("Max PDF pages to OCR (0 = all)", 0, 10000, 30, 5)
     pdf_render_zoom = st.slider("PDF render quality (zoom)", 1.0, 3.0, 2.0, 0.25)
     ocr_downscale_max_dim = st.number_input("Downscale OCR images max dimension (px)", 800, 5000, 2200, 100)
 
-    if enable_pdf_ocr and fitz is None:
-        st.warning("OCR needs PyMuPDF: pip install pymupdf")
+    if fitz is None:
+        st.info("For scanned PDFs, install OCR renderer: `pip install pymupdf`")
 
 
 # -----------------------------
@@ -542,28 +541,27 @@ if docs:
 
     low_text_pdfs = [d for d in docs if d.kind == "pdf" and is_text_sparse(d.text, int(pdf_ocr_chars_threshold))]
     if low_text_pdfs:
-        st.warning("Some PDFs look scanned / low-text. OCR will run (if enabled) and then they’ll compile normally.")
+        st.warning("Some PDFs look scanned / low-text. OCR will run automatically and then they’ll compile normally.")
 
 
 def compile_pipeline(docs: List[DocItem]) -> str:
     if not docs:
         raise RuntimeError("No files uploaded.")
 
-    # 1) Transcribe uploaded images into text (and lightly structure them)
+    # 1) OCR uploaded images to plain text (no summarizing)
     vision_docs = [d for d in docs if d.kind == "image"]
     if vision_docs:
-        st.subheader("🖼️ Transcribing uploaded images")
+        st.subheader("🖼️ Extracting text from uploaded images")
         for i, d in enumerate(vision_docs, 1):
             st.write(f"Image {i}/{len(vision_docs)}: `{d.name}`")
-            cache_key = f"img:{d.sha256}:{model}:{level}:{mode}"
+            cache_key = f"img:{d.sha256}:{model}"
             if cache_key in st.session_state["doc_cache"]:
                 d.text = st.session_state["doc_cache"][cache_key]
                 st.caption("Cached ✅")
                 continue
 
-            prompt = "Extract ALL readable text from this image of notes. Output as plain text (no summarizing)."
             txt = oai_vision(
-                prompt,
+                "Extract ALL readable text. Output text only.",
                 d.image_bytes or b"",
                 d.mime or "image/png",
                 model=model,
@@ -575,63 +573,58 @@ def compile_pipeline(docs: List[DocItem]) -> str:
             d.text = clean_text(txt)
             st.session_state["doc_cache"][cache_key] = d.text
 
-    # 2) OCR scanned PDFs
-    if enable_pdf_ocr:
-        scanned = [d for d in docs if d.kind == "pdf" and is_text_sparse(d.text, int(pdf_ocr_chars_threshold))]
-        if scanned:
-            st.subheader("🧾 OCR for scanned / low-text PDFs")
-            if fitz is None:
-                raise RuntimeError("OCR enabled but PyMuPDF is missing. Run: pip install pymupdf")
+    # 2) OCR scanned PDFs (always-on when detected)
+    scanned = [d for d in docs if d.kind == "pdf" and is_text_sparse(d.text, int(pdf_ocr_chars_threshold))]
+    if scanned:
+        if fitz is None:
+            raise RuntimeError("Scanned PDFs detected but PyMuPDF is missing. Install: pip install pymupdf")
 
-            for d in scanned:
-                if not d.raw_bytes:
+        st.subheader("🧾 OCR scanned / low-text PDFs")
+        for d in scanned:
+            if not d.raw_bytes:
+                continue
+
+            st.write(f"OCR: `{d.name}`")
+            page_texts: List[str] = []
+
+            for page_no, png_bytes in pdf_pages_to_pngs(
+                d.raw_bytes,
+                zoom=float(pdf_render_zoom),
+                max_pages=int(pdf_ocr_max_pages),
+            ):
+                png_bytes = maybe_downscale_png(png_bytes, max_dim=int(ocr_downscale_max_dim))
+                cache_key = f"pdfocr:{d.sha256}:p{page_no}:z{pdf_render_zoom}:md{ocr_downscale_max_dim}:{model}"
+
+                if cache_key in st.session_state["chunk_cache"]:
+                    page_texts.append(st.session_state["chunk_cache"][cache_key])
                     continue
 
-                st.write(f"OCR: `{d.name}`")
-                page_texts: List[str] = []
+                page_txt = oai_vision(
+                    "Extract ALL readable text. Preserve headings/bullets/equations. Output text only.",
+                    png_bytes,
+                    "image/png",
+                    model=model,
+                    instructions="You are an OCR engine. Output text only. No commentary.",
+                    temperature=0.0,
+                    max_output_tokens=2000,
+                    store=store,
+                )
+                page_txt = clean_text(page_txt)
+                st.session_state["chunk_cache"][cache_key] = page_txt
+                page_texts.append(page_txt)
 
-                for page_no, png_bytes in pdf_pages_to_pngs(
-                    d.raw_bytes,
-                    zoom=float(pdf_render_zoom),
-                    max_pages=int(pdf_ocr_max_pages),
-                ):
-                    png_bytes = maybe_downscale_png(png_bytes, max_dim=int(ocr_downscale_max_dim))
-                    cache_key = f"pdfocr:{d.sha256}:p{page_no}:z{pdf_render_zoom}:md{ocr_downscale_max_dim}:{model}"
-
-                    if cache_key in st.session_state["chunk_cache"]:
-                        page_texts.append(st.session_state["chunk_cache"][cache_key])
-                        continue
-
-                    prompt = (
-                        "Extract ALL readable text from this scanned PDF page. "
-                        "Do NOT summarize. Preserve headings, bullets, numbering, and equations."
-                    )
-                    page_txt = oai_vision(
-                        prompt,
-                        png_bytes,
-                        "image/png",
-                        model=model,
-                        instructions="You are an OCR engine. Output text only. No extra commentary.",
-                        temperature=0.0,
-                        max_output_tokens=2000,
-                        store=store,
-                    )
-                    page_txt = clean_text(page_txt)
-                    st.session_state["chunk_cache"][cache_key] = page_txt
-                    page_texts.append(page_txt)
-
-                d.text = clean_text("\n\n".join(page_texts))
+            d.text = clean_text("\n\n".join(page_texts))
 
     # 3) Chunk + summarize each doc
     st.subheader("🧩 Chunking & summarizing")
     usable_docs = [d for d in docs if (d.text or "").strip()]
     if not usable_docs:
-        raise RuntimeError("No usable text extracted. (If scanned PDFs: enable OCR and install pymupdf.)")
+        raise RuntimeError("No usable text extracted.")
 
     progress = st.progress(0.0)
     status = st.empty()
 
-    # Estimate progress steps
+    # estimate steps
     doc_chunks_map = {}
     total_steps = 0
     for d in usable_docs:
@@ -659,9 +652,8 @@ def compile_pipeline(docs: List[DocItem]) -> str:
                 chunk_summaries.append(st.session_state["chunk_cache"][ck])
                 continue
 
-            prompt = make_chunk_prompt(d.name, idx, ch, mode, level)
             summ = oai_text(
-                prompt,
+                make_chunk_prompt(d.name, idx, ch, mode, level),
                 model=model,
                 instructions=BASE_INSTRUCTIONS,
                 temperature=temperature,
@@ -672,15 +664,14 @@ def compile_pipeline(docs: List[DocItem]) -> str:
             st.session_state["chunk_cache"][ck] = summ
             chunk_summaries.append(summ)
 
-        # Merge per document
+        # merge per doc
         status.write(f"Merging chunks for `{d.name}` …")
         mk = f"docmerge:{d.sha256}:{model}:{level}:{mode}"
         if mk in st.session_state["doc_cache"]:
             merged = st.session_state["doc_cache"][mk]
         else:
-            prompt = make_doc_merge_prompt(d.name, chunk_summaries, mode, level)
             merged = oai_text(
-                prompt,
+                make_doc_merge_prompt(d.name, chunk_summaries, mode, level),
                 model=model,
                 instructions=BASE_INSTRUCTIONS,
                 temperature=max(0.0, min(0.35, temperature)),
@@ -692,9 +683,6 @@ def compile_pipeline(docs: List[DocItem]) -> str:
 
         doc_notes_list.append((d.name, merged))
 
-    if not doc_notes_list:
-        raise RuntimeError("Nothing to compile after processing.")
-
     st.session_state["doc_notes_list"] = doc_notes_list
 
     # 4) Global compile
@@ -703,9 +691,8 @@ def compile_pipeline(docs: List[DocItem]) -> str:
     if st.session_state.get("compiled_notes") and st.session_state.get("compiled_key") == compiled_key:
         return st.session_state["compiled_notes"]
 
-    prompt = make_global_merge_prompt(doc_notes_list, mode, level)
     compiled = oai_text(
-        prompt,
+        make_global_merge_prompt(doc_notes_list, mode, level),
         model=model,
         instructions=BASE_INSTRUCTIONS,
         temperature=max(0.0, min(0.35, temperature)),
@@ -713,29 +700,22 @@ def compile_pipeline(docs: List[DocItem]) -> str:
         store=store,
     )
     compiled = clean_text(compiled)
-
     st.session_state["compiled_key"] = compiled_key
     st.session_state["compiled_notes"] = compiled
     return compiled
 
 
-# -----------------------------
-# RUN COMPILE
-# -----------------------------
 if compile_btn:
     try:
         if OpenAI is None:
             st.error("Missing OpenAI SDK. Install: pip install openai")
         else:
-            compiled = compile_pipeline(docs)
+            _ = compile_pipeline(docs)
             st.success("Compiled ✅ Scroll down to download.")
     except Exception as e:
         st.error(f"Compile failed: {e}")
 
 
-# -----------------------------
-# OUTPUT + DOWNLOAD
-# -----------------------------
 compiled = st.session_state.get("compiled_notes")
 if compiled:
     st.subheader("📘 Compiled Notes (Preview)")
